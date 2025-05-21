@@ -1,0 +1,5 @@
+esp_logs/
+venv/
+*.pyc
+__pycache__/
+.venv/

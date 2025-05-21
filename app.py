@@ -282,11 +282,11 @@ with st.sidebar:
             if st.button("🔌 Connect", disabled=selected_port_disabled):
                 if selected_port and connect_to_serial(selected_port):
                     threading.Thread(target=serial_reader, daemon=True).start()
-                    st.experimental_rerun() # Refresh UI after connection attempt
+                    st.rerun() # Refresh UI after connection attempt
         else:
             if st.button("✖️ Disconnect"):
                 disconnect_serial()
-                st.experimental_rerun() # Refresh UI
+                st.rerun() # Refresh UI
     
     with col_con2:
         status_text = "Connected" if st.session_state.connected else "Disconnected"
@@ -299,7 +299,7 @@ with st.sidebar:
         st.session_state.map_data = pd.DataFrame(columns=['lat', 'lon', 'status', 'message_id', 'temperature', 'motion', 'time'])
         st.session_state.node_status = {} # Also clear node status for consistency
         log_event("Messages, Map, and Node Status cleared.", "normal")
-        st.experimental_rerun()
+        st.rerun()
 
 # Main content Tabs
 tab_dashboard, tab_messages, tab_nodes, tab_events = st.tabs([
@@ -506,4 +506,4 @@ with tab_events:
 if new_data_received or (time.time() - st.session_state.last_update > 2): # Refresh if new data or 2s elapsed
     st.session_state.last_update = time.time()
     if st.session_state.connected or messages_processed_this_run > 0 : # Only rerun if connected or if we just processed data
-         st.experimental_rerun()
+         st.rerun()
