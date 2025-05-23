@@ -1,18 +1,16 @@
 import streamlit as st
-import serial
-import serial.tools.list_ports
 import json
 import pandas as pd
 import time
 import threading
 import queue
-import re
 import datetime
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
+import glob
+import os
 from collections import deque
 from typing import Dict, List, Optional, Tuple, Deque
+import plotly.express as px
+import plotly.graph_objects as go
 
 # Set page config
 st.set_page_config(
@@ -24,17 +22,15 @@ st.set_page_config(
 
 # Define constants
 MAX_MESSAGES = 100  # Maximum number of messages to keep in memory
-BAUD_RATE = 115200  # Serial baud rate
+LOG_CHECK_INTERVAL = 1.0  # Check for new log files every second
 
 # Initialize session state variables if they don't exist
 if 'connected' not in st.session_state:
     st.session_state.connected = False
-if 'serial_port' not in st.session_state:
-    st.session_state.serial_port = None
+if 'log_reader_thread' not in st.session_state:
+    st.session_state.log_reader_thread = None
 if 'messages' not in st.session_state:
     st.session_state.messages = []
-if 'serial_buffer' not in st.session_state:
-    st.session_state.serial_buffer = ""
 if 'message_queue' not in st.session_state:
     st.session_state.message_queue = queue.Queue()
 if 'last_update' not in st.session_state:
@@ -45,6 +41,14 @@ if 'map_data' not in st.session_state:
     st.session_state.map_data = pd.DataFrame(columns=['lat', 'lon', 'status', 'message_id', 'temperature', 'motion', 'time'])
 if 'event_log' not in st.session_state:
     st.session_state.event_log = deque(maxlen=100)  # Keep last 100 events
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = set()  # Track which files we've already processed
+if 'file_positions' not in st.session_state:
+    st.session_state.file_positions = {}  # Track position in each file
+if 'selected_log_path' not in st.session_state:
+    st.session_state.selected_log_path = "esp_logs/"
+if 'current_log_file' not in st.session_state:
+    st.session_state.current_log_file = None  # Track the currently monitored file
 
 # CSS styling
 st.markdown("""
@@ -91,126 +95,144 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Helper functions
-def find_available_ports():
-    """Return a list of available serial ports."""
-    return [p.device for p in serial.tools.list_ports.comports()]
+def find_log_files(log_path):
+    """Find all ESP log files in the specified directory."""
+    if not os.path.exists(log_path):
+        return []
+    
+    pattern = os.path.join(log_path, "esp_log_*.jsonl")
+    return sorted(glob.glob(pattern))
 
-def connect_to_serial(port):
-    """Connect to the selected serial port."""
+def get_most_recent_log_file(log_path):
+    """Get the most recent log file based on timestamp in filename."""
+    log_files = find_log_files(log_path)
+    if not log_files:
+        return None
+    
+    # Sort by modification time as fallback, then by filename timestamp
+    log_files_with_time = []
+    for file_path in log_files:
+        filename = os.path.basename(file_path)
+        try:
+            # Extract timestamp from filename like esp_log_20250521_143124.jsonl
+            timestamp_part = filename.replace('esp_log_', '').replace('.jsonl', '')
+            # Convert to datetime for proper sorting
+            file_time = datetime.datetime.strptime(timestamp_part, '%Y%m%d_%H%M%S')
+            log_files_with_time.append((file_path, file_time))
+        except ValueError:
+            # If timestamp parsing fails, use file modification time
+            mod_time = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
+            log_files_with_time.append((file_path, mod_time))
+    
+    # Sort by timestamp (most recent first)
+    log_files_with_time.sort(key=lambda x: x[1], reverse=True)
+    return log_files_with_time[0][0] if log_files_with_time else None
+
+def connect_to_logs(log_path):
+    """Start monitoring the most recent log file in the specified directory."""
     try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+        if not os.path.exists(log_path):
+            st.error(f"Log directory '{log_path}' does not exist.")
+            return False
+        
+        most_recent_file = get_most_recent_log_file(log_path)
+        if not most_recent_file:
+            st.warning(f"No .jsonl log files found in '{log_path}' matching pattern 'esp_log_*.jsonl'")
+            return False
+        
         st.session_state.connected = True
-        st.session_state.serial_port = ser
-        log_event(f"Connected to {port}", "success")
+        st.session_state.selected_log_path = log_path
+        st.session_state.current_log_file = most_recent_file
+        # Reset file position for the new file
+        st.session_state.file_positions = {most_recent_file: 0}
+        
+        log_event(f"Started monitoring most recent log file: {os.path.basename(most_recent_file)}", "success")
         return True
     except Exception as e:
-        st.error(f"Failed to connect to {port}: {str(e)}")
-        log_event(f"Connection failed: {str(e)}", "error")
+        st.error(f"Failed to start monitoring logs: {str(e)}")
+        log_event(f"Log monitoring failed: {str(e)}", "error")
         return False
 
-def disconnect_serial():
-    """Disconnect from the serial port."""
-    if st.session_state.serial_port:
-        try:
-            st.session_state.serial_port.close()
-        except:
-            pass # Ignore errors on close
-        st.session_state.connected = False
-        st.session_state.serial_port = None
-        log_event("Disconnected from serial port", "normal")
+def disconnect_logs():
+    """Stop monitoring log files."""
+    st.session_state.connected = False
+    st.session_state.current_log_file = None
+    log_event("Stopped monitoring log files", "normal")
 
-def extract_packet_data(line):
-    """
-    Extract packet data from a serial line.
-    Expected format from ESP8266 printPacket function:
-    ID: %s | MAC: %02X:%02X:%02X:%02X:%02X:%02X | TS: %lu | Lat: %.4f | Lon: %.4f | EQ: %d | Motion: %.2f | Gas: %d | Temp: %.2fC | Prio: %d | TTL: %d | Retry: %d
-    Example: "ID: AB:CD:EF:12:34:56_12345 | MAC: AB:CD:EF:12:34:56 | TS: 12345 | Lat: 0.0000 | Lon: 0.0000 | EQ: 0 | Motion: 0.12 | Gas: 0 | Temp: 23.50C | Prio: 1 | TTL: 3 | Retry: 0"
-    """
+def process_json_line(json_line):
+    """Process a single JSON line from the log file."""
     try:
-        id_match = re.search(r'ID: ([^\s|]+)', line)
-        message_id = id_match.group(1) if id_match else "unknown_id"
+        data = json.loads(json_line.strip())
         
-        mac_match = re.search(r'MAC: ([0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2})', line)
-        mac = mac_match.group(1) if mac_match else "unknown_mac"
-        
-        ts_match = re.search(r'TS: (\d+)', line)
-        timestamp = int(ts_match.group(1)) if ts_match else 0
-        
-        lat_match = re.search(r'Lat: ([-\d.]+)', line)
-        lat = float(lat_match.group(1)) if lat_match else 0.0
-        
-        lon_match = re.search(r'Lon: ([-\d.]+)', line)
-        lon = float(lon_match.group(1)) if lon_match else 0.0
-        
-        eq_match = re.search(r'EQ: (\d)', line) # Usually 0 or 1
-        earthquake = bool(int(eq_match.group(1))) if eq_match else False
-        
-        motion_match = re.search(r'Motion: ([\d.]+)', line)
-        motion = float(motion_match.group(1)) if motion_match else 0.0
-        
-        gas_match = re.search(r'Gas: (\d)', line) # Usually 0 or 1
-        gas_alert = bool(int(gas_match.group(1))) if gas_match else False
-        
-        temp_match = re.search(r'Temp: ([-\d.]+)C', line) # Corrected to include 'C'
-        temp = float(temp_match.group(1)) if temp_match else -999.0 # ESP error value
-        
-        priority_match = re.search(r'Prio: (\d)', line)
-        priority = int(priority_match.group(1)) if priority_match else 0
-        
-        ttl_match = re.search(r'TTL: (\d+)', line)
-        ttl = int(ttl_match.group(1)) if ttl_match else 0
-        
-        retry_match = re.search(r'Retry: (\d+)', line)
-        retry = int(retry_match.group(1)) if retry_match else 0
-        
-        alert_level = "normal"
-        if earthquake:
-            alert_level = "alert"
-        elif gas_alert:
-            alert_level = "warning" # Or "alert" depending on severity
-        elif motion > 1.0: # Significant motion but below earthquake threshold
-            alert_level = "warning"
-        
-        packet = {
-            "message_id": message_id,
-            "mac": mac,
-            "timestamp": timestamp, # ESP8266 millis()
-            "received_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "latitude": lat,
-            "longitude": lon,
-            "earthquake": earthquake,
-            "motion": motion,
-            "gas_alert": gas_alert,
-            "temperature": temp,
-            "priority": priority,
-            "ttl": ttl,
-            "retry_count": retry,
-            "alert_level": alert_level
-        }
-        
-        update_node_status(mac, packet)
-        
-        if earthquake:
-            log_event(f"EARTHQUAKE DETECTED by {mac} - Motion: {motion:.2f}g, Prio: {priority}", "error")
-        elif gas_alert:
-            log_event(f"GAS ALERT from {mac}, Prio: {priority}", "warning")
-        elif motion > 1.0 and motion < 1.5 : # ACC_THRESHOLD is 1.5 in C++
-             log_event(f"Significant motion: {motion:.2f}g by {mac}, Prio: {priority}", "warning")
+        if data.get("type") == "packet_data" and "parsed_data" in data:
+            # Extract packet data from the parsed_data field
+            parsed = data["parsed_data"]
+            
+            # Convert to the format expected by the rest of the application
+            packet = {
+                "message_id": parsed.get("message_id", "unknown_id"),
+                "mac": parsed.get("mac", "unknown_mac"),
+                "timestamp": parsed.get("device_timestamp_ms", 0),
+                "received_time": datetime.datetime.fromisoformat(parsed.get("received_time_iso", data.get("timestamp_iso", ""))).strftime("%Y-%m-%d %H:%M:%S"),
+                "latitude": parsed.get("latitude", 0.0),
+                "longitude": parsed.get("longitude", 0.0),
+                "earthquake": parsed.get("earthquake_triggered", False),
+                "motion": parsed.get("motion_g", 0.0),
+                "gas_alert": parsed.get("gas_alert_triggered", False),
+                "temperature": parsed.get("temperature_celsius", -999.0),
+                "priority": parsed.get("priority", 0),
+                "ttl": parsed.get("ttl", 0),
+                "retry_count": parsed.get("retry_count", 0),
+                "alert_level": "normal"
+            }
+            
+            # Determine alert level
+            if packet["earthquake"]:
+                packet["alert_level"] = "alert"
+            elif packet["gas_alert"]:
+                packet["alert_level"] = "warning"
+            elif packet["motion"] > 1.0:
+                packet["alert_level"] = "warning"
+            
+            update_node_status(packet["mac"], packet)
+            
+            # Log events for alerts
+            if packet["earthquake"]:
+                log_event(f"EARTHQUAKE DETECTED by {packet['mac']} - Motion: {packet['motion']:.2f}g, Prio: {packet['priority']}", "error")
+            elif packet["gas_alert"]:
+                log_event(f"GAS ALERT from {packet['mac']}, Prio: {packet['priority']}", "warning")
+            elif packet["motion"] > 1.0 and packet["motion"] < 1.5:
+                log_event(f"Significant motion: {packet['motion']:.2f}g by {packet['mac']}, Prio: {packet['priority']}", "warning")
 
-        if lat != 0.0 and lon != 0.0:
-            status_map = "alert" if earthquake or gas_alert else "normal"
-            new_point = pd.DataFrame([{
-                'lat': lat, 'lon': lon, 'status': status_map,
-                'message_id': message_id, 'temperature': temp,
-                'motion': motion, 'time': datetime.datetime.now().strftime("%H:%M:%S")
-            }])
-            st.session_state.map_data = pd.concat([st.session_state.map_data, new_point], ignore_index=True)
-            if len(st.session_state.map_data) > 100: # Keep last 100 points for map
-                st.session_state.map_data = st.session_state.map_data.iloc[-100:]
+            # Update map data
+            if packet["latitude"] != 0.0 and packet["longitude"] != 0.0:
+                status_map = "alert" if packet["earthquake"] or packet["gas_alert"] else "normal"
+                new_point = pd.DataFrame([{
+                    'lat': packet["latitude"], 'lon': packet["longitude"], 'status': status_map,
+                    'message_id': packet["message_id"], 'temperature': packet["temperature"],
+                    'motion': packet["motion"], 'time': datetime.datetime.now().strftime("%H:%M:%S")
+                }])
+                st.session_state.map_data = pd.concat([st.session_state.map_data, new_point], ignore_index=True)
+                if len(st.session_state.map_data) > 100:
+                    st.session_state.map_data = st.session_state.map_data.iloc[-100:]
+            
+            return packet
         
-        return packet
+        elif data.get("type") == "generic_log":
+            # Log generic messages to event log
+            raw_msg = data.get("raw_message", "")
+            if raw_msg.strip():
+                if "HIGH PRIORITY" in raw_msg:
+                    log_event(f"LOG: {raw_msg}", "warning")
+                else:
+                    log_event(f"LOG: {raw_msg}", "normal")
+        
+        return None
+    except json.JSONDecodeError as e:
+        log_event(f"Error parsing JSON line: {str(e)}", "error")
+        return None
     except Exception as e:
-        log_event(f"Error parsing packet data from line '{line}': {str(e)}", "error")
+        log_event(f"Error processing JSON data: {str(e)}", "error")
         return None
 
 def update_node_status(mac, packet):
@@ -238,55 +260,95 @@ def log_event(message, level="normal"):
         "level": level
     })
 
-def serial_reader():
-    """Read from serial port and add to message queue."""
+def log_file_reader():
+    """Read from the most recent log file and add to message queue."""
     while st.session_state.connected:
         try:
-            if st.session_state.serial_port and st.session_state.serial_port.is_open:
-                line = st.session_state.serial_port.readline().decode('utf-8', errors='replace').strip()
-                if line:
-                    st.session_state.message_queue.put(line)
-            else: # Connection lost or port not open
-                if st.session_state.connected: # if we thought we were connected
-                    log_event("Serial port no longer open. Attempting to disconnect.", "error")
-                    st.session_state.connected = False # Trigger UI update and stop loop
-                break
-        except serial.SerialException as e:
-            log_event(f"Serial read error: {str(e)}. Disconnecting.", "error")
-            st.session_state.connected = False # Ensure disconnected state
-            break # Exit thread on serial error
-        except Exception as e: # Catch any other unexpected error
-            log_event(f"Unexpected error in serial_reader: {str(e)}. Disconnecting.", "error")
-            st.session_state.connected = False
-            break
-        time.sleep(0.01)
+            # Check if we need to switch to a newer log file
+            current_most_recent = get_most_recent_log_file(st.session_state.selected_log_path)
+            
+            if current_most_recent and current_most_recent != st.session_state.current_log_file:
+                # Switch to the newer file
+                st.session_state.current_log_file = current_most_recent
+                st.session_state.file_positions[current_most_recent] = 0  # Start from beginning of new file
+                log_event(f"Switched to newer log file: {os.path.basename(current_most_recent)}", "success")
+            
+            if st.session_state.current_log_file:
+                log_file = st.session_state.current_log_file
+                current_pos = st.session_state.file_positions.get(log_file, 0)
+                
+                try:
+                    with open(log_file, 'r', encoding='utf-8') as f:
+                        f.seek(current_pos)
+                        
+                        for line in f:
+                            if line.strip():
+                                st.session_state.message_queue.put(line.strip())
+                        
+                        # Update position for this file
+                        st.session_state.file_positions[log_file] = f.tell()
+                        
+                except (FileNotFoundError, PermissionError) as e:
+                    log_event(f"Cannot read log file {log_file}: {str(e)}", "error")
+            
+            time.sleep(LOG_CHECK_INTERVAL)
+            
+        except Exception as e:
+            log_event(f"Error in log file reader: {str(e)}", "error")
+            time.sleep(LOG_CHECK_INTERVAL)
 
 # --- UI Layout ---
 st.title("🛰️ ESP-NOW Mesh Network Monitor")
 
 # Sidebar
 with st.sidebar:
-    st.header("Connection")
-    port_list = find_available_ports()
-    if not port_list:
-        st.warning("No serial ports detected.")
-        selected_port_disabled = True
-    else:
-        selected_port_disabled = False
-
-    selected_port = st.selectbox("Select Serial Port", port_list, disabled=selected_port_disabled)
+    st.header("Log File Connection")
     
+    # Log directory input
+    log_path = st.text_input("Log Directory Path", value=st.session_state.selected_log_path)
+    
+    # Show available log files and current file being monitored
+    if os.path.exists(log_path):
+        log_files = find_log_files(log_path)
+        if log_files:
+            st.success(f"Found {len(log_files)} .jsonl log file(s)")
+            
+            # Show the most recent file that would be selected
+            most_recent = get_most_recent_log_file(log_path)
+            if most_recent:
+                st.info(f"Most recent: {os.path.basename(most_recent)}")
+            
+            # Show currently monitored file if connected
+            if st.session_state.connected and st.session_state.current_log_file:
+                st.success(f"📖 Currently monitoring: {os.path.basename(st.session_state.current_log_file)}")
+            
+            with st.expander("All Log Files", expanded=False):
+                for f in reversed(log_files):  # Show newest first
+                    file_time = "Unknown"
+                    try:
+                        filename = os.path.basename(f)
+                        timestamp_part = filename.replace('esp_log_', '').replace('.jsonl', '')
+                        file_time = datetime.datetime.strptime(timestamp_part, '%Y%m%d_%H%M%S').strftime('%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        pass
+                    st.text(f"{os.path.basename(f)} ({file_time})")
+        else:
+            st.warning("No .jsonl log files found matching pattern 'esp_log_*.jsonl'")
+    else:
+        st.error(f"Directory '{log_path}' does not exist")
+
     col_con1, col_con2 = st.columns(2)
     with col_con1:
         if not st.session_state.connected:
-            if st.button("🔌 Connect", disabled=selected_port_disabled):
-                if selected_port and connect_to_serial(selected_port):
-                    threading.Thread(target=serial_reader, daemon=True).start()
-                    st.rerun() # Refresh UI after connection attempt
+            if st.button("🔌 Connect"):
+                if connect_to_logs(log_path):
+                    st.session_state.log_reader_thread = threading.Thread(target=log_file_reader, daemon=True)
+                    st.session_state.log_reader_thread.start()
+                    st.rerun()
         else:
             if st.button("✖️ Disconnect"):
-                disconnect_serial()
-                st.rerun() # Refresh UI
+                disconnect_logs()
+                st.rerun()
     
     with col_con2:
         status_text = "Connected" if st.session_state.connected else "Disconnected"
@@ -297,8 +359,11 @@ with st.sidebar:
     if st.button("Clear Messages & Map"):
         st.session_state.messages = []
         st.session_state.map_data = pd.DataFrame(columns=['lat', 'lon', 'status', 'message_id', 'temperature', 'motion', 'time'])
-        st.session_state.node_status = {} # Also clear node status for consistency
-        log_event("Messages, Map, and Node Status cleared.", "normal")
+        st.session_state.node_status = {}
+        # Only reset position for current file, not all files
+        if st.session_state.current_log_file:
+            st.session_state.file_positions = {st.session_state.current_log_file: 0}
+        log_event("Messages, Map, Node Status cleared. File position reset to beginning.", "normal")
         st.rerun()
 
 # Main content Tabs
@@ -309,22 +374,17 @@ tab_dashboard, tab_messages, tab_nodes, tab_events = st.tabs([
 # Process message queue (common to multiple tabs)
 messages_processed_this_run = 0
 new_data_received = False
-if st.session_state.connected or not st.session_state.message_queue.empty(): # Process if connected or if there's backlog
-    while not st.session_state.message_queue.empty() and messages_processed_this_run < 20: # Process more messages per run
-        line = st.session_state.message_queue.get_nowait() # Use get_nowait as we check empty()
+if st.session_state.connected or not st.session_state.message_queue.empty():
+    while not st.session_state.message_queue.empty() and messages_processed_this_run < 20:
+        json_line = st.session_state.message_queue.get_nowait()
         new_data_received = True
         
-        # Check if line matches the expected packet format
-        if all(kw in line for kw in ["ID:", "MAC:", "Lat:", "Lon:", "Temp:"]):
-            packet_data = extract_packet_data(line)
-            if packet_data:
-                st.session_state.messages.append(packet_data)
-                if len(st.session_state.messages) > MAX_MESSAGES:
-                    st.session_state.messages = st.session_state.messages[-MAX_MESSAGES:]
-        else:
-            # For non-packet messages, log them to the event log if they are not empty
-            if line.strip(): # Avoid logging empty lines
-                log_event(f"RAW: {line}", "normal") # Distinguish raw serial lines
+        packet_data = process_json_line(json_line)
+        if packet_data:
+            st.session_state.messages.append(packet_data)
+            if len(st.session_state.messages) > MAX_MESSAGES:
+                st.session_state.messages = st.session_state.messages[-MAX_MESSAGES:]
+        
         messages_processed_this_run += 1
 
 with tab_dashboard:
@@ -340,7 +400,6 @@ with tab_dashboard:
 
     if node_count > 0:
         now = time.time()
-        # Consider node active if seen in the last 60 seconds
         recently_active_nodes = sum(1 for node in st.session_state.node_status.values() if (now - node["last_seen"]) < 60)
         health_percentage = int((recently_active_nodes / node_count) * 100)
     else:
@@ -353,7 +412,6 @@ with tab_dashboard:
     with col_map:
         st.subheader("🌍 Node Map")
         if not st.session_state.map_data.empty and not st.session_state.map_data[['lat', 'lon']].eq(0).all().all():
-            # Filter out 0,0 coordinates before plotting if they are not desired
             map_df_filtered = st.session_state.map_data[~((st.session_state.map_data['lat'] == 0) & (st.session_state.map_data['lon'] == 0))]
             if not map_df_filtered.empty:
                 fig = px.scatter_mapbox(
@@ -377,12 +435,12 @@ with tab_dashboard:
         if st.session_state.messages:
             # Temperature Chart
             temp_data_points = []
-            for msg in st.session_state.messages[-20:]: # Last 20
+            for msg in st.session_state.messages[-20:]:
                 if "temperature" in msg and msg["temperature"] != -999.0:
                     temp_data_points.append({
                         "time": msg.get("received_time"), 
                         "temperature": msg["temperature"], 
-                        "node": msg["mac"][-5:] # Short MAC
+                        "node": msg["mac"][-5:]
                     })
             if temp_data_points:
                 temp_df = pd.DataFrame(temp_data_points)
@@ -394,12 +452,12 @@ with tab_dashboard:
 
             # Motion Chart
             motion_data_points = []
-            for msg in st.session_state.messages[-20:]: # Last 20
+            for msg in st.session_state.messages[-20:]:
                 if "motion" in msg:
                     motion_data_points.append({
                         "time": msg.get("received_time"), 
                         "motion": msg["motion"], 
-                        "node": msg["mac"][-5:] # Short MAC
+                        "node": msg["mac"][-5:]
                     })
             if motion_data_points:
                 motion_df = pd.DataFrame(motion_data_points)
@@ -416,16 +474,15 @@ with tab_dashboard:
     recent_alerts = [msg for msg in reversed(st.session_state.messages) if msg.get("alert_level") in ["warning", "alert"]]
     
     if recent_alerts:
-        for alert in recent_alerts[:5]: # Display latest 5
+        for alert in recent_alerts[:5]:
             alert_type_icon = "🌍" if alert.get("earthquake") else "🔥" if alert.get("gas_alert") else "🏃"
-            alert_color = "red" if alert.get("alert_level") == "alert" else "orange"
             details = f"Node: **{alert.get('mac', '')}** (Prio: {alert.get('priority', 0)}) at {alert.get('received_time', '')}<br>"
             details += f"Motion: {alert.get('motion', 0):.2f}g | Temp: {alert.get('temperature', 0):.1f}°C"
             if alert.get("earthquake"):
                 st.error(f"{alert_type_icon} EARTHQUAKE ALERT: {details}", icon="🚨")
             elif alert.get("gas_alert"):
                 st.warning(f"{alert_type_icon} GAS ALERT: {details}", icon="🔥")
-            elif alert.get("alert_level") == "warning": # Motion warning
+            elif alert.get("alert_level") == "warning":
                  st.warning(f"{alert_type_icon} MOTION WARNING: {details}", icon="⚠️")
     else:
         st.success("✔️ No active alerts.", icon="✅")
@@ -435,7 +492,7 @@ with tab_messages:
     st.subheader("📨 Detailed Message Log")
     if st.session_state.messages:
         display_df_data = []
-        for msg in reversed(st.session_state.messages): # Show newest first
+        for msg in reversed(st.session_state.messages):
             status_icon = "🚨" if msg.get("alert_level") == "alert" else "⚠️" if msg.get("alert_level") == "warning" else "✔️"
             display_df_data.append({
                 "Status": status_icon,
@@ -492,18 +549,18 @@ with tab_nodes:
                 else: alert_status = "<span>Normal</span>"
                 cols_node[3].markdown(f"**Node Alert:**<br>{alert_status}", unsafe_allow_html=True)
     else:
-        st.info("No nodes discovered yet. Connect to a device to see node statuses.")
+        st.info("No nodes discovered yet. Connect to log files to see node statuses.")
 
 with tab_events:
-    st.subheader("📜 Application & Raw Serial Event Log")
+    st.subheader("📜 Application & Log Event Log")
     if st.session_state.event_log:
-        for event in st.session_state.event_log: # deque appends left, so iterate normally for chronological
+        for event in st.session_state.event_log:
             st.markdown(f"<span class='event-{event['level']}'>[{event['timestamp']}] {event['message']}</span>", unsafe_allow_html=True)
     else:
         st.info("No events logged yet.")
 
 # Auto-refresh logic
-if new_data_received or (time.time() - st.session_state.last_update > 2): # Refresh if new data or 2s elapsed
+if new_data_received or (time.time() - st.session_state.last_update > 2):
     st.session_state.last_update = time.time()
-    if st.session_state.connected or messages_processed_this_run > 0 : # Only rerun if connected or if we just processed data
+    if st.session_state.connected or messages_processed_this_run > 0:
          st.rerun()
