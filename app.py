@@ -2,8 +2,6 @@ import streamlit as st
 import json
 import pandas as pd
 import time
-import threading
-import queue
 import datetime
 import glob
 import os
@@ -22,33 +20,22 @@ st.set_page_config(
 
 # Define constants
 MAX_MESSAGES = 100  # Maximum number of messages to keep in memory
-LOG_CHECK_INTERVAL = 1.0  # Check for new log files every second
 
 # Initialize session state variables if they don't exist
-if 'connected' not in st.session_state:
-    st.session_state.connected = False
-if 'log_reader_thread' not in st.session_state:
-    st.session_state.log_reader_thread = None
 if 'messages' not in st.session_state:
     st.session_state.messages = []
-if 'message_queue' not in st.session_state:
-    st.session_state.message_queue = queue.Queue()
-if 'last_update' not in st.session_state:
-    st.session_state.last_update = time.time()
 if 'node_status' not in st.session_state:
     st.session_state.node_status = {}  # Dictionary to track status of each node
 if 'map_data' not in st.session_state:
     st.session_state.map_data = pd.DataFrame(columns=['lat', 'lon', 'status', 'message_id', 'temperature', 'motion', 'time'])
 if 'event_log' not in st.session_state:
     st.session_state.event_log = deque(maxlen=100)  # Keep last 100 events
-if 'processed_files' not in st.session_state:
-    st.session_state.processed_files = set()  # Track which files we've already processed
 if 'file_positions' not in st.session_state:
     st.session_state.file_positions = {}  # Track position in each file
 if 'selected_log_path' not in st.session_state:
     st.session_state.selected_log_path = "esp_logs/"
-if 'current_log_file' not in st.session_state:
-    st.session_state.current_log_file = None  # Track the currently monitored file
+if 'last_check_time' not in st.session_state:
+    st.session_state.last_check_time = 0
 
 # CSS styling
 st.markdown("""
@@ -127,37 +114,6 @@ def get_most_recent_log_file(log_path):
     # Sort by timestamp (most recent first)
     log_files_with_time.sort(key=lambda x: x[1], reverse=True)
     return log_files_with_time[0][0] if log_files_with_time else None
-
-def connect_to_logs(log_path):
-    """Start monitoring the most recent log file in the specified directory."""
-    try:
-        if not os.path.exists(log_path):
-            st.error(f"Log directory '{log_path}' does not exist.")
-            return False
-        
-        most_recent_file = get_most_recent_log_file(log_path)
-        if not most_recent_file:
-            st.warning(f"No .jsonl log files found in '{log_path}' matching pattern 'esp_log_*.jsonl'")
-            return False
-        
-        st.session_state.connected = True
-        st.session_state.selected_log_path = log_path
-        st.session_state.current_log_file = most_recent_file
-        # Reset file position for the new file
-        st.session_state.file_positions = {most_recent_file: 0}
-        
-        log_event(f"Started monitoring most recent log file: {os.path.basename(most_recent_file)}", "success")
-        return True
-    except Exception as e:
-        st.error(f"Failed to start monitoring logs: {str(e)}")
-        log_event(f"Log monitoring failed: {str(e)}", "error")
-        return False
-
-def disconnect_logs():
-    """Stop monitoring log files."""
-    st.session_state.connected = False
-    st.session_state.current_log_file = None
-    log_event("Stopped monitoring log files", "normal")
 
 def process_json_line(json_line):
     """Process a single JSON line from the log file."""
@@ -260,52 +216,64 @@ def log_event(message, level="normal"):
         "level": level
     })
 
-def log_file_reader():
-    """Read from the most recent log file and add to message queue."""
-    while st.session_state.connected:
-        try:
-            # Check if we need to switch to a newer log file
-            current_most_recent = get_most_recent_log_file(st.session_state.selected_log_path)
+def read_new_log_data(log_path):
+    """Read new data from the most recent log file."""
+    current_time = time.time()
+    
+    # Only check for new data every second to avoid too frequent file operations
+    if current_time - st.session_state.last_check_time < 1.0:
+        return False
+    
+    st.session_state.last_check_time = current_time
+    
+    most_recent_file = get_most_recent_log_file(log_path)
+    if not most_recent_file:
+        return False
+    
+    new_data_found = False
+    
+    try:
+        # Get current position for this file
+        current_pos = st.session_state.file_positions.get(most_recent_file, 0)
+        
+        with open(most_recent_file, 'r', encoding='utf-8') as f:
+            f.seek(current_pos)
             
-            if current_most_recent and current_most_recent != st.session_state.current_log_file:
-                # Switch to the newer file
-                st.session_state.current_log_file = current_most_recent
-                st.session_state.file_positions[current_most_recent] = 0  # Start from beginning of new file
-                log_event(f"Switched to newer log file: {os.path.basename(current_most_recent)}", "success")
+            lines_processed = 0
+            for line in f:
+                if line.strip():
+                    packet_data = process_json_line(line.strip())
+                    if packet_data:
+                        st.session_state.messages.append(packet_data)
+                        if len(st.session_state.messages) > MAX_MESSAGES:
+                            st.session_state.messages = st.session_state.messages[-MAX_MESSAGES:]
+                        new_data_found = True
+                    
+                    lines_processed += 1
+                    # Limit processing to avoid blocking UI
+                    if lines_processed >= 50:
+                        break
             
-            if st.session_state.current_log_file:
-                log_file = st.session_state.current_log_file
-                current_pos = st.session_state.file_positions.get(log_file, 0)
-                
-                try:
-                    with open(log_file, 'r', encoding='utf-8') as f:
-                        f.seek(current_pos)
-                        
-                        for line in f:
-                            if line.strip():
-                                st.session_state.message_queue.put(line.strip())
-                        
-                        # Update position for this file
-                        st.session_state.file_positions[log_file] = f.tell()
-                        
-                except (FileNotFoundError, PermissionError) as e:
-                    log_event(f"Cannot read log file {log_file}: {str(e)}", "error")
+            # Update position for this file
+            st.session_state.file_positions[most_recent_file] = f.tell()
             
-            time.sleep(LOG_CHECK_INTERVAL)
-            
-        except Exception as e:
-            log_event(f"Error in log file reader: {str(e)}", "error")
-            time.sleep(LOG_CHECK_INTERVAL)
+    except (FileNotFoundError, PermissionError) as e:
+        log_event(f"Cannot read log file {most_recent_file}: {str(e)}", "error")
+    except Exception as e:
+        log_event(f"Error reading log file: {str(e)}", "error")
+    
+    return new_data_found
 
 # --- UI Layout ---
 st.title("🛰️ ESP-NOW Mesh Network Monitor")
 
 # Sidebar
 with st.sidebar:
-    st.header("Log File Connection")
+    st.header("Log File Monitor")
     
     # Log directory input
     log_path = st.text_input("Log Directory Path", value=st.session_state.selected_log_path)
+    st.session_state.selected_log_path = log_path
     
     # Show available log files and current file being monitored
     if os.path.exists(log_path):
@@ -316,11 +284,7 @@ with st.sidebar:
             # Show the most recent file that would be selected
             most_recent = get_most_recent_log_file(log_path)
             if most_recent:
-                st.info(f"Most recent: {os.path.basename(most_recent)}")
-            
-            # Show currently monitored file if connected
-            if st.session_state.connected and st.session_state.current_log_file:
-                st.success(f"📖 Currently monitoring: {os.path.basename(st.session_state.current_log_file)}")
+                st.info(f"📖 Monitoring: {os.path.basename(most_recent)}")
             
             with st.expander("All Log Files", expanded=False):
                 for f in reversed(log_files):  # Show newest first
@@ -337,33 +301,14 @@ with st.sidebar:
     else:
         st.error(f"Directory '{log_path}' does not exist")
 
-    col_con1, col_con2 = st.columns(2)
-    with col_con1:
-        if not st.session_state.connected:
-            if st.button("🔌 Connect"):
-                if connect_to_logs(log_path):
-                    st.session_state.log_reader_thread = threading.Thread(target=log_file_reader, daemon=True)
-                    st.session_state.log_reader_thread.start()
-                    st.rerun()
-        else:
-            if st.button("✖️ Disconnect"):
-                disconnect_logs()
-                st.rerun()
-    
-    with col_con2:
-        status_text = "Connected" if st.session_state.connected else "Disconnected"
-        status_class = "status-connected" if st.session_state.connected else "status-disconnected"
-        st.markdown(f"<p class='{status_class}'>Status: {status_text}</p>", unsafe_allow_html=True)
-
     st.header("Controls")
-    if st.button("Clear Messages & Map"):
+    if st.button("Clear All Data"):
         st.session_state.messages = []
         st.session_state.map_data = pd.DataFrame(columns=['lat', 'lon', 'status', 'message_id', 'temperature', 'motion', 'time'])
         st.session_state.node_status = {}
-        # Only reset position for current file, not all files
-        if st.session_state.current_log_file:
-            st.session_state.file_positions = {st.session_state.current_log_file: 0}
-        log_event("Messages, Map, Node Status cleared. File position reset to beginning.", "normal")
+        st.session_state.file_positions = {}
+        st.session_state.event_log.clear()
+        log_event("All data cleared and file positions reset.", "normal")
         st.rerun()
 
 # Main content Tabs
@@ -371,21 +316,8 @@ tab_dashboard, tab_messages, tab_nodes, tab_events = st.tabs([
     "📊 Dashboard", "📨 Message Log", "📶 Node Status", "📜 Event Log"
 ])
 
-# Process message queue (common to multiple tabs)
-messages_processed_this_run = 0
-new_data_received = False
-if st.session_state.connected or not st.session_state.message_queue.empty():
-    while not st.session_state.message_queue.empty() and messages_processed_this_run < 20:
-        json_line = st.session_state.message_queue.get_nowait()
-        new_data_received = True
-        
-        packet_data = process_json_line(json_line)
-        if packet_data:
-            st.session_state.messages.append(packet_data)
-            if len(st.session_state.messages) > MAX_MESSAGES:
-                st.session_state.messages = st.session_state.messages[-MAX_MESSAGES:]
-        
-        messages_processed_this_run += 1
+# Read new log data
+new_data_received = read_new_log_data(st.session_state.selected_log_path)
 
 with tab_dashboard:
     st.subheader("🚀 Network Overview")
@@ -549,7 +481,7 @@ with tab_nodes:
                 else: alert_status = "<span>Normal</span>"
                 cols_node[3].markdown(f"**Node Alert:**<br>{alert_status}", unsafe_allow_html=True)
     else:
-        st.info("No nodes discovered yet. Connect to log files to see node statuses.")
+        st.info("No nodes discovered yet. Waiting for log data...")
 
 with tab_events:
     st.subheader("📜 Application & Log Event Log")
@@ -559,8 +491,11 @@ with tab_events:
     else:
         st.info("No events logged yet.")
 
-# Auto-refresh logic
-if new_data_received or (time.time() - st.session_state.last_update > 2):
-    st.session_state.last_update = time.time()
-    if st.session_state.connected or messages_processed_this_run > 0:
-         st.rerun()
+# Auto-refresh - rerun every 2 seconds or when new data is found
+if new_data_received:
+    time.sleep(0.1)  # Small delay to prevent too rapid refreshes
+    st.rerun()
+else:
+    # Auto-refresh every 2 seconds even without new data to update timestamps
+    time.sleep(2)
+    st.rerun()
