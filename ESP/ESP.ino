@@ -10,12 +10,12 @@
 #include <SoftwareSerial.h> // Added for GPS
 
 // Choose only one role by uncommenting the appropriate line
-#define ROLE_SENDER
+// #define ROLE_SENDER
 // #define ROLE_REBROADCASTER
-// #define ROLE_RECEIVER
+#define ROLE_RECEIVER
 
 // Pin definitions
-#define DHTPIN 2      // GPIO2 (D4 on NodeMCU)
+#define DHTPIN 13     // GPIO13 (D7 on NodeMCU)
 #define DHTTYPE DHT22
 #define SOS_BUTTON_PIN 0  // GPIO0 (D3 on NodeMCU - typically FLASH button)
 #define GAS_SENSOR_PIN A0 // Analog pin for MQ-2
@@ -166,12 +166,12 @@ void storePacketToSPIFFS(const SOSPacket& pkt) {
 }
 
 // --- Print packet details to Serial ---
-void printPacket(const SOSPacket& pkt) {
-  Serial.printf("ID: %s | MAC: %02X:%02X:%02X:%02X:%02X:%02X | TS: %lu | Lat: %.4f | Lon: %.4f | EQ: %d | Motion: %.2f | Gas: %d | Temp: %.2fC | Prio: %d | TTL: %d | Retry: %d\n",
+void printPacket(const SOSPacket& pkt, float smokePPM = 0.0) {
+  Serial.printf("ID: %s | MAC: %02X:%02X:%02X:%02X:%02X:%02X | TS: %lu | Lat: %.4f | Lon: %.4f | EQ: %d | Motion: %.2f | Gas: %d | Smoke PPM: %.1f | Temp: %.2fC | Prio: %d | TTL: %d | Retry: %d\n",
                 pkt.message_id,
                 pkt.sender_mac[0], pkt.sender_mac[1], pkt.sender_mac[2], pkt.sender_mac[3], pkt.sender_mac[4], pkt.sender_mac[5],
                 pkt.timestamp, pkt.lat, pkt.lon,
-                pkt.earthquake, pkt.motion, pkt.gas_alert, pkt.temperature,
+                pkt.earthquake, pkt.motion, pkt.gas_alert, smokePPM, pkt.temperature,
                 pkt.priority, pkt.ttl, pkt.retry_count);
 }
 
@@ -258,7 +258,7 @@ void processRetryQueue() {
 // --- Create a new SOS packet ---
 SOSPacket createSOSPacket(bool earthquake, float motion, bool gas_alert, float temperature, uint8_t priority) {
   SOSPacket pkt;
-  
+
   // Create a unique message ID: MAC_timestamp
   String mac_addr_str = WiFi.macAddress();
   mac_addr_str.replace(":", ""); // Remove colons for shorter ID
@@ -266,26 +266,27 @@ SOSPacket createSOSPacket(bool earthquake, float motion, bool gas_alert, float t
 
   WiFi.macAddress(pkt.sender_mac); // Get MAC address as byte array
   pkt.timestamp = millis();
-  
+
+  // Use default location if GPS is not valid
   if (gps.location.isValid()) {
     pkt.lat = gps.location.lat();
     pkt.lon = gps.location.lng();
   } else {
-    pkt.lat = 0.0;
-    pkt.lon = 0.0;
+    pkt.lat = 12.924751;   // Default latitude
+    pkt.lon = 77.499257;   // Default longitude
   }
-  
+
   pkt.earthquake = earthquake;
   pkt.motion = motion;
   pkt.gas_alert = gas_alert;
   pkt.temperature = temperature;
   pkt.priority = priority;
-  
+
   // Dynamic TTL based on priority (higher priority = higher TTL)
   pkt.ttl = TTL_BASE + (priority - 1);
-  
+
   pkt.retry_count = 0;
-  
+
   return pkt;
 }
 
@@ -385,11 +386,22 @@ void loop() {
 
   // Read gas sensor (MQ-2)
   int gasValue = analogRead(GAS_SENSOR_PIN);
-  bool gas_alert = gasValue > GAS_THRESHOLD;
+  float smokePPM = mq2AnalogToPPM(gasValue) / 10;
+  bool gas_alert = smokePPM > 500.0; // 500 PPM as a valid smoke threshold
+
+  // Print MQ-2 value and PPM
+  Serial.print("MQ-2 Analog Value: ");
+  Serial.print(gasValue);
+  Serial.print(" | Smoke PPM: ");
+  Serial.println(smokePPM);
 
   // Check for trigger conditions
   bool sosButtonPressed = (digitalRead(SOS_BUTTON_PIN) == LOW);
-  
+  if (sosButtonPressed) {
+    Serial.println("SOS Button Pressed!");
+  }
+
+  // Trigger SOS on any of the conditions
   if (earthquake || gas_alert || sosButtonPressed) {
     Serial.println("SOS Condition Triggered!");
     
@@ -417,7 +429,7 @@ void loop() {
     // Print packet details
     Serial.print("Created packet: ");
     printPacket(pkt);
-    
+
     // Debounce or prevent immediate re-trigger if button is held
     if (sosButtonPressed) {
       Serial.println("SOS Button pressed. Waiting for release or timeout...");
@@ -638,3 +650,12 @@ void loop() {
   delay(1000);
 }
 #endif // ROLE_RECEIVER
+
+// Estimate PPM for smoke from MQ-2 analog value (very rough, for demo purposes)
+// You should calibrate for your environment for real use!
+float mq2AnalogToPPM(int analogValue) {
+    // MQ-2 analog output: 0 (clean air) to 1023 (max concentration)
+    // Assume 0 = 0 PPM, 1023 = 10000 PPM (arbitrary, for demonstration)
+    // For smoke, 200-300 PPM is a typical threshold for alert
+    return (analogValue / 1023.0) * 10000.0;
+}
