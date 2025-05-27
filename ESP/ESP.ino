@@ -18,7 +18,8 @@
 #define DHTPIN 2      // GPIO2 (D4 on NodeMCU)
 #define DHTTYPE DHT22
 #define SOS_BUTTON_PIN 0  // GPIO0 (D3 on NodeMCU - typically FLASH button)
-// #define GAS_SENSOR_PIN A0 // Analog pin for gas sensor if available
+#define GAS_SENSOR_PIN A0 // Analog pin for MQ-2
+#define GAS_THRESHOLD 400 // Adjust based on calibration
 
 // GPS Pins (using SoftwareSerial)
 #define GPS_RX_PIN 14 // GPIO14 (D5 on NodeMCU) - Connect to GPS TX
@@ -382,16 +383,14 @@ void loop() {
     temperature = -999.0; // Error indicator
   }
 
-  // Read gas sensor (placeholder - implement as needed)
-  bool gas_alert = false; 
-  // If you have a gas sensor connected:
-  // int gasValue = analogRead(GAS_SENSOR_PIN);
-  // gas_alert = gasValue > GAS_THRESHOLD;
+  // Read gas sensor (MQ-2)
+  int gasValue = analogRead(GAS_SENSOR_PIN);
+  bool gas_alert = gasValue > GAS_THRESHOLD;
 
   // Check for trigger conditions
   bool sosButtonPressed = (digitalRead(SOS_BUTTON_PIN) == LOW);
   
-  if (true) { // earthquake || gas_alert || sosButtonPressed
+  if (earthquake || gas_alert || sosButtonPressed) {
     Serial.println("SOS Condition Triggered!");
     
     // Determine priority based on triggers
@@ -428,6 +427,8 @@ void loop() {
       }
       delay(1000); // Additional delay after release
     }
+
+    delay(5000); // 5 second delay after sending any packet
   }
 
   delay(1000); // Main loop delay
