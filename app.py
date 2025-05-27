@@ -260,41 +260,25 @@ def log_event(message, level="normal"):
         "level": level
     })
 
-def log_file_reader():
+def log_file_reader(log_path, log_file, message_queue, stop_event):
     """Read from the most recent log file and add to message queue."""
-    while st.session_state.connected:
+    file_positions = {log_file: 0}
+    while not stop_event.is_set():
         try:
-            # Check if we need to switch to a newer log file
-            current_most_recent = get_most_recent_log_file(st.session_state.selected_log_path)
-            
-            if current_most_recent and current_most_recent != st.session_state.current_log_file:
-                # Switch to the newer file
-                st.session_state.current_log_file = current_most_recent
-                st.session_state.file_positions[current_most_recent] = 0  # Start from beginning of new file
-                log_event(f"Switched to newer log file: {os.path.basename(current_most_recent)}", "success")
-            
-            if st.session_state.current_log_file:
-                log_file = st.session_state.current_log_file
-                current_pos = st.session_state.file_positions.get(log_file, 0)
-                
+            # Check for new log file (implement if needed)
+            if log_file:
+                current_pos = file_positions.get(log_file, 0)
                 try:
                     with open(log_file, 'r', encoding='utf-8') as f:
                         f.seek(current_pos)
-                        
                         for line in f:
                             if line.strip():
-                                st.session_state.message_queue.put(line.strip())
-                        
-                        # Update position for this file
-                        st.session_state.file_positions[log_file] = f.tell()
-                        
-                except (FileNotFoundError, PermissionError) as e:
-                    log_event(f"Cannot read log file {log_file}: {str(e)}", "error")
-            
+                                message_queue.put(line.strip())
+                        file_positions[log_file] = f.tell()
+                except (FileNotFoundError, PermissionError):
+                    pass
             time.sleep(LOG_CHECK_INTERVAL)
-            
-        except Exception as e:
-            log_event(f"Error in log file reader: {str(e)}", "error")
+        except Exception:
             time.sleep(LOG_CHECK_INTERVAL)
 
 # --- UI Layout ---
@@ -342,11 +326,19 @@ with st.sidebar:
         if not st.session_state.connected:
             if st.button("🔌 Connect"):
                 if connect_to_logs(log_path):
-                    st.session_state.log_reader_thread = threading.Thread(target=log_file_reader, daemon=True)
+                    stop_event = threading.Event()
+                    st.session_state.stop_event = stop_event
+                    st.session_state.log_reader_thread = threading.Thread(
+                        target=log_file_reader,
+                        args=(log_path, st.session_state.current_log_file, st.session_state.message_queue, stop_event),
+                        daemon=True
+                    )
                     st.session_state.log_reader_thread.start()
                     st.rerun()
         else:
             if st.button("✖️ Disconnect"):
+                if 'stop_event' in st.session_state:
+                    st.session_state.stop_event.set()
                 disconnect_logs()
                 st.rerun()
     

@@ -10,9 +10,9 @@
 #include <SoftwareSerial.h> // Added for GPS
 
 // Choose only one role by uncommenting the appropriate line
-#define ROLE_SENDER
+// #define ROLE_SENDER
 // #define ROLE_REBROADCASTER
-// #define ROLE_RECEIVER
+#define ROLE_RECEIVER
 
 // Pin definitions
 #define DHTPIN 2      // GPIO2 (D4 on NodeMCU)
