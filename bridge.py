@@ -34,7 +34,7 @@ def parse_packet_line(line):
     """
     Parse an ESP-NOW packet line and convert to a dictionary.
     Expected format from ESP8266 printPacket function:
-    ID: %s | MAC: %02X:%02X:%02X:%02X:%02X:%02X | TS: %lu | Lat: %.4f | Lon: %.4f | EQ: %d | Motion: %.2f | Gas: %d | Temp: %.2fC | Prio: %d | TTL: %d | Retry: %d
+    ID: ... | ... | Smoke PPM: %.1f | ...
     """
     try:
         id_match = re.search(r'ID: ([^\s|]+)', line)
@@ -49,6 +49,7 @@ def parse_packet_line(line):
         prio_match = re.search(r'Prio: (\d)', line)
         ttl_match = re.search(r'TTL: (\d+)', line)
         retry_match = re.search(r'Retry: (\d+)', line)
+        smokeppm_match = re.search(r'Smoke PPM: ([\d.]+)', line)
         
         packet = {
             "message_id": id_match.group(1) if id_match else "parse_error",
@@ -63,7 +64,8 @@ def parse_packet_line(line):
             "temperature_celsius": float(temp_match.group(1)) if temp_match else -999.0, # ESP error value
             "priority": int(prio_match.group(1)) if prio_match else 0,
             "ttl": int(ttl_match.group(1)) if ttl_match else 0,
-            "retry_count": int(retry_match.group(1)) if retry_match else 0
+            "retry_count": int(retry_match.group(1)) if retry_match else 0,
+            "smoke_ppm": float(smokeppm_match.group(1)) if smokeppm_match else 0.0,
         }
         return packet
     except Exception as e:

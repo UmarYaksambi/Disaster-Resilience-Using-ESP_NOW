@@ -22,7 +22,7 @@ st.set_page_config(
 
 # Define constants
 MAX_MESSAGES = 100  # Maximum number of messages to keep in memory
-LOG_CHECK_INTERVAL = 1.0  # Check for new log files every second
+LOG_CHECK_INTERVAL = 0.2  # Check for new log lines every 0.2 seconds
 
 # Initialize session state variables if they don't exist
 if 'connected' not in st.session_state:
@@ -212,9 +212,11 @@ def process_json_line(json_line):
                     'message_id': packet["message_id"], 'temperature': packet["temperature"],
                     'motion': packet["motion"], 'time': datetime.datetime.now().strftime("%H:%M:%S")
                 }])
-                st.session_state.map_data = pd.concat([st.session_state.map_data, new_point], ignore_index=True)
-                if len(st.session_state.map_data) > 100:
-                    st.session_state.map_data = st.session_state.map_data.iloc[-100:]
+                dfs = [df for df in [st.session_state.map_data, new_point] if not df.empty]
+                if dfs:
+                    st.session_state.map_data = pd.concat(dfs, ignore_index=True)
+                    if len(st.session_state.map_data) > 100:
+                        st.session_state.map_data = st.session_state.map_data.iloc[-100:]
             
             return packet
         
@@ -406,7 +408,7 @@ with tab_dashboard:
         if not st.session_state.map_data.empty and not st.session_state.map_data[['lat', 'lon']].eq(0).all().all():
             map_df_filtered = st.session_state.map_data[~((st.session_state.map_data['lat'] == 0) & (st.session_state.map_data['lon'] == 0))]
             if not map_df_filtered.empty:
-                fig = px.scatter_mapbox(
+                fig = px.scatter_map(
                     map_df_filtered,
                     lat="lat", lon="lon",
                     hover_name="message_id",
@@ -415,7 +417,7 @@ with tab_dashboard:
                     color_discrete_map={"normal": "green", "warning": "orange", "alert": "red"},
                     zoom=10, height=450
                 )
-                fig.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
+                fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No valid GPS coordinates (non-zero) received for map display.")
@@ -542,7 +544,7 @@ with tab_nodes:
                 cols_node[3].markdown(f"**Node Alert:**<br>{alert_status}", unsafe_allow_html=True)
     else:
         st.info("No nodes discovered yet. Connect to log files to see node statuses.")
-
+6
 with tab_events:
     st.subheader("📜 Application & Log Event Log")
     if st.session_state.event_log:
@@ -552,7 +554,10 @@ with tab_events:
         st.info("No events logged yet.")
 
 # Auto-refresh logic
-if new_data_received or (time.time() - st.session_state.last_update > 2):
+if new_data_received:
+    st.session_state.last_update = time.time()
+    st.rerun()
+elif time.time() - st.session_state.last_update > 2:
     st.session_state.last_update = time.time()
     if st.session_state.connected or messages_processed_this_run > 0:
-         st.rerun()
+        st.rerun()
