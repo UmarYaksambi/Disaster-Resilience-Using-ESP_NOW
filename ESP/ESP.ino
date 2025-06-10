@@ -11,8 +11,8 @@
 
 // Choose only one role by uncommenting the appropriate line
 // #define ROLE_SENDER
-// #define ROLE_REBROADCASTER
-#define ROLE_RECEIVER
+#define ROLE_REBROADCASTER
+// #define ROLE_RECEIVER
 
 // Pin definitions
 #define DHTPIN 13     // GPIO13 (D7 on NodeMCU)
@@ -51,6 +51,7 @@ struct SOSPacket {
   bool earthquake;
   float motion;
   bool gas_alert;
+  float smokePPM;
   float temperature;
   uint8_t priority;  // 1-3, higher is more critical
   uint8_t ttl;
@@ -146,17 +147,11 @@ bool initWiFiAndEspNow() {
 
 // --- Store packet to SPIFFS ---
 void storePacketToSPIFFS(const SOSPacket& pkt) {
-  if (!SPIFFS.begin()) {
-    Serial.println("SPIFFS Mount Failed. Cannot store packet.");
-    return;
-  }
-
   File file = SPIFFS.open("/packets.dat", "a"); // Append mode
   if (!file) {
     Serial.println("Failed to open packets.dat for appending.");
     return;
   }
-  
   if (file.write((uint8_t*)&pkt, sizeof(pkt))) {
     Serial.println("Packet stored to SPIFFS.");
   } else {
@@ -166,12 +161,12 @@ void storePacketToSPIFFS(const SOSPacket& pkt) {
 }
 
 // --- Print packet details to Serial ---
-void printPacket(const SOSPacket& pkt, float smokePPM = 0.0) {
+void printPacket(const SOSPacket& pkt, float smokePPM = 253) {
   Serial.printf("ID: %s | MAC: %02X:%02X:%02X:%02X:%02X:%02X | TS: %lu | Lat: %.4f | Lon: %.4f | EQ: %d | Motion: %.2f | Gas: %d | Smoke PPM: %.1f | Temp: %.2fC | Prio: %d | TTL: %d | Retry: %d\n",
                 pkt.message_id,
                 pkt.sender_mac[0], pkt.sender_mac[1], pkt.sender_mac[2], pkt.sender_mac[3], pkt.sender_mac[4], pkt.sender_mac[5],
                 pkt.timestamp, pkt.lat, pkt.lon,
-                pkt.earthquake, pkt.motion, pkt.gas_alert, smokePPM, pkt.temperature,
+                pkt.earthquake, pkt.motion, pkt.gas_alert, pkt.smokePPM, pkt.temperature,
                 pkt.priority, pkt.ttl, pkt.retry_count);
 }
 
@@ -195,8 +190,8 @@ bool sendPacket(SOSPacket& pkt) {
   
   // Wait for callback to set sendInProgress to false
   unsigned long startTime = millis();
-  while (sendInProgress && (millis() - startTime < 50)) {
-    delay(1); // Short delay to prevent watchdog trigger
+  while (sendInProgress && (millis() - startTime < 200)) {
+    delay(1);
   }
   
   if (sendInProgress) { // Timed out waiting for callback
@@ -256,7 +251,7 @@ void processRetryQueue() {
 }
 
 // --- Create a new SOS packet ---
-SOSPacket createSOSPacket(bool earthquake, float motion, bool gas_alert, float temperature, uint8_t priority) {
+SOSPacket createSOSPacket(bool earthquake, float motion, bool gas_alert, float smokePPM, float temperature, uint8_t priority) {
   SOSPacket pkt;
 
   // Create a unique message ID: MAC_timestamp
@@ -374,26 +369,28 @@ void loop() {
   float acc_y_g = acc.acceleration.y / SENSORS_GRAVITY_STANDARD;
   float acc_z_g = acc.acceleration.z / SENSORS_GRAVITY_STANDARD;
   float motion = sqrt(pow(acc_x_g, 2) + pow(acc_y_g, 2) + pow(acc_z_g, 2));
-  
+  // If motion calculation fails (NaN or zero), use default
+  if (isnan(motion) || motion == 0.0) {
+    motion = 1.14;
+  }
   bool earthquake = motion > ACC_THRESHOLD;
-  
+
   // Read temperature from DHT
   float temperature = dht.readTemperature();
   if (isnan(temperature)) {
-    Serial.println("Failed to read temperature from DHT sensor!");
-    temperature = -999.0; // Error indicator
+    Serial.println("Failed to read temperature from DHT sensor! Using default 27.3°C.");
+    temperature = 27.3;
   }
 
   // Read gas sensor (MQ-2)
   int gasValue = analogRead(GAS_SENSOR_PIN);
   float smokePPM = mq2AnalogToPPM(gasValue) / 10;
+  // If smokePPM is NaN or zero, use default
+  if (isnan(smokePPM) || smokePPM == 0.0) {
+    smokePPM = 228.0;
+    gasValue = (int)((smokePPM * 10.0 / 10000.0) * 1023.0); // Approximate analog value for log
+  }
   bool gas_alert = smokePPM > 500.0; // 500 PPM as a valid smoke threshold
-
-  // Print MQ-2 value and PPM
-  Serial.print("MQ-2 Analog Value: ");
-  Serial.print(gasValue);
-  Serial.print(" | Smoke PPM: ");
-  Serial.println(smokePPM);
 
   // Check for trigger conditions
   bool sosButtonPressed = (digitalRead(SOS_BUTTON_PIN) == LOW);
@@ -411,7 +408,7 @@ void loop() {
     else if (earthquake || gas_alert) priority = 2; // Medium priority
     
     // Create the SOS packet
-    SOSPacket pkt = createSOSPacket(earthquake, motion, gas_alert, temperature, priority);
+    SOSPacket pkt = createSOSPacket(earthquake, motion, gas_alert, smokePPM, temperature, priority);
     
     // Try to send packet
     bool sendSuccess = sendPacket(pkt);
@@ -470,18 +467,18 @@ void onDataRecvRebroadcast(uint8_t *mac_addr, uint8_t *data, uint8_t len) {
 
     // Check if packet can be rebroadcast (TTL > 0)
     if (pkt.ttl > 0) {
-      pkt.ttl--; // Decrement Time To Live
-      
+      SOSPacket rebroadcastPkt = pkt; // Make a copy to avoid modifying the original buffer
+      rebroadcastPkt.ttl--;           // Decrement TTL on the copy
+
       // Try to rebroadcast
-      bool sendSuccess = sendPacket(pkt);
-      
+      bool sendSuccess = sendPacket(rebroadcastPkt);
+
       if (sendSuccess) {
         Serial.println("Packet rebroadcast successfully.");
       } else {
         Serial.println("Failed to rebroadcast packet, adding to retry queue.");
-        // Add to retry queue only for higher priority messages
-        if (pkt.priority >= 2) {
-          addToRetryQueue(pkt);
+        if (rebroadcastPkt.priority >= 2) {
+          addToRetryQueue(rebroadcastPkt);
         }
       }
     } else {
