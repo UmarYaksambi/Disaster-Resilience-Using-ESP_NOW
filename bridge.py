@@ -118,7 +118,8 @@ def main():
             if line:
                 print(f"RAW > {line}") # Print raw line for debugging
                 
-                log_entry = {
+                from typing import Any
+                log_entry: dict[str, Any] = {
                     "type": "unknown",
                     "timestamp_iso": datetime.datetime.now().isoformat(),
                     "raw_message": line

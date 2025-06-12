@@ -408,7 +408,7 @@ with tab_dashboard:
         if not st.session_state.map_data.empty and not st.session_state.map_data[['lat', 'lon']].eq(0).all().all():
             map_df_filtered = st.session_state.map_data[~((st.session_state.map_data['lat'] == 0) & (st.session_state.map_data['lon'] == 0))]
             if not map_df_filtered.empty:
-                fig = px.scatter_map(
+                fig = px.scatter_mapbox(
                     map_df_filtered,
                     lat="lat", lon="lon",
                     hover_name="message_id",
@@ -417,7 +417,7 @@ with tab_dashboard:
                     color_discrete_map={"normal": "green", "warning": "orange", "alert": "red"},
                     zoom=10, height=450
                 )
-                fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+                fig.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No valid GPS coordinates (non-zero) received for map display.")
@@ -544,7 +544,7 @@ with tab_nodes:
                 cols_node[3].markdown(f"**Node Alert:**<br>{alert_status}", unsafe_allow_html=True)
     else:
         st.info("No nodes discovered yet. Connect to log files to see node statuses.")
-6
+
 with tab_events:
     st.subheader("📜 Application & Log Event Log")
     if st.session_state.event_log:
