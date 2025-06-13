@@ -11,8 +11,8 @@
 
 // Choose only one role by uncommenting the appropriate line
 // #define ROLE_SENDER
-#define ROLE_REBROADCASTER
-// #define ROLE_RECEIVER
+// #define ROLE_REBROADCASTER
+#define ROLE_RECEIVER
 
 // Pin definitions
 #define DHTPIN 13     // GPIO13 (D7 on NodeMCU)
@@ -46,17 +46,17 @@ struct SOSPacket {
   char message_id[32];
   uint8_t sender_mac[6];
   uint32_t timestamp;
-  double lat;
-  double lon;
-  bool earthquake;
+  float lat;
+  float lon;
+  uint8_t earthquake;   // was bool
   float motion;
-  bool gas_alert;
+  uint8_t gas_alert;    // was bool
   float smokePPM;
   float temperature;
-  uint8_t priority;  // 1-3, higher is more critical
+  uint8_t priority;
   uint8_t ttl;
-  uint8_t retry_count; // Track number of send attempts
-};
+  uint8_t retry_count;
+} __attribute__((packed));
 
 // For tracking sent messages that need retry
 #define MAX_PENDING_MSGS 5
@@ -78,7 +78,7 @@ int current_seen_ids_count = 0;
 
 bool alreadySeen(const char* id) {
   for (int i = 0; i < current_seen_ids_count; i++) {
-    if (seen_ids[i] == id) {
+    if (seen_ids[i].equals(id)) { 
       return true;
     }
   }
@@ -168,11 +168,15 @@ void printPacket(const SOSPacket& pkt, float smokePPM = 253) {
                 pkt.timestamp, pkt.lat, pkt.lon,
                 pkt.earthquake, pkt.motion, pkt.gas_alert, pkt.smokePPM, pkt.temperature,
                 pkt.priority, pkt.ttl, pkt.retry_count);
+  uint8_t* p = (uint8_t*)&pkt;
+  for (int i = 0; i < 8; i++) {
+    Serial.printf("%02X ", p[i]);
+  }
+  Serial.println();
 }
 
 // --- Send packet via ESP-NOW ---
 bool sendPacket(SOSPacket& pkt) {
-  // Don't attempt to send if another send is in progress
   if (sendInProgress) {
     Serial.println("Send already in progress, deferring...");
     return false;
@@ -180,26 +184,26 @@ bool sendPacket(SOSPacket& pkt) {
 
   sendInProgress = true;
   int send_result = esp_now_send(broadcastAddress, (uint8_t*)&pkt, sizeof(pkt));
-  
-  if (send_result != 0) { // 0 means success for ESP8266
+
+  Serial.print(send_result);
+  if (send_result != 0) {
     sendInProgress = false;
     Serial.print("Error initiating ESP-NOW send. Code: ");
     Serial.println(send_result);
     return false;
   }
-  
-  // Wait for callback to set sendInProgress to false
+
   unsigned long startTime = millis();
   while (sendInProgress && (millis() - startTime < 200)) {
     delay(1);
   }
-  
-  if (sendInProgress) { // Timed out waiting for callback
+
+  if (sendInProgress) {
     sendInProgress = false;
     Serial.println("Send callback timed out!");
     return false;
   }
-  
+
   return lastSendSuccess;
 }
 
@@ -447,30 +451,37 @@ void loop() {
 // ===================== REBROADCASTER =====================
 #ifdef ROLE_REBROADCASTER
 
-// ESP-NOW Receive Callback for Rebroadcaster
+// ESP-NOW Receive Callback for Rebroadcaster (modeled after receiver)
 void onDataRecvRebroadcast(uint8_t *mac_addr, uint8_t *data, uint8_t len) {
   if (len != sizeof(SOSPacket)) {
-    Serial.println("Received packet with incorrect size.");
+    Serial.printf("Received packet with incorrect size. Got %d, expected %d\n", len, sizeof(SOSPacket));
     return;
   }
-  
-  // Copy the received data to our packet structure
+
   SOSPacket pkt;
   memcpy(&pkt, data, sizeof(SOSPacket));
+
+  // Print MAC of sender for debugging
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  Serial.printf("Packet received from MAC: %s\n", macStr);
 
   // Check if we've seen this message before
   if (!alreadySeen(pkt.message_id)) {
     markSeen(pkt.message_id);
-    
-    Serial.print("New packet received: ");
+
+    Serial.print("Processing new packet: ");
     printPacket(pkt);
 
-    // Check if packet can be rebroadcast (TTL > 0)
-    if (pkt.ttl > 0) {
-      SOSPacket rebroadcastPkt = pkt; // Make a copy to avoid modifying the original buffer
-      rebroadcastPkt.ttl--;           // Decrement TTL on the copy
+    // Store in SPIFFS
+    storePacketToSPIFFS(pkt);
 
-      // Try to rebroadcast
+    // Rebroadcast logic
+    if (pkt.ttl > 0) {
+      SOSPacket rebroadcastPkt = pkt;
+      rebroadcastPkt.ttl--;
+
       bool sendSuccess = sendPacket(rebroadcastPkt);
 
       if (sendSuccess) {
@@ -485,7 +496,7 @@ void onDataRecvRebroadcast(uint8_t *mac_addr, uint8_t *data, uint8_t len) {
       Serial.println("Packet TTL expired, not rebroadcasting.");
     }
   } else {
-    Serial.printf("Packet already seen, ignoring: %s\n", pkt.message_id);
+    Serial.printf("Packet already processed (duplicate): %s\n", pkt.message_id);
   }
 }
 
@@ -493,6 +504,22 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n\nREBROADCASTER initializing...");
+
+  // --- ADD THIS BLOCK ---
+  // Initialize SPIFFS for local storage
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS Mount Failed. Formatting...");
+    if (SPIFFS.format()) {
+        Serial.println("SPIFFS Formatted. Please reboot.");
+        ESP.restart();
+    } else {
+        Serial.println("SPIFFS Format Failed.");
+    }
+    while(1) delay(100); // Halt
+  } else {
+    Serial.println("SPIFFS Mounted.");
+  }
+  // --- END BLOCK ---
 
   // Initialize WiFi and ESP-NOW
   if (!initWiFiAndEspNow()) {
@@ -538,7 +565,7 @@ void loop() {
 // ESP-NOW Receive Callback for Receiver
 void onDataRecvStore(uint8_t *mac_addr, uint8_t *data, uint8_t len) {
   if (len != sizeof(SOSPacket)) {
-    Serial.println("Received packet with incorrect size.");
+    Serial.printf("Received packet with incorrect size. Got %d, expected %d\n", len, sizeof(SOSPacket));
     return;
   }
   
