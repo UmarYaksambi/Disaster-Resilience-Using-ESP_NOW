@@ -255,6 +255,7 @@ void processRetryQueue() {
 }
 
 // --- Create a new SOS packet ---
+// IMPROVED: Always fill all fields, check for sensor errors, and use defaults if needed
 SOSPacket createSOSPacket(bool earthquake, float motion, bool gas_alert, float smokePPM, float temperature, uint8_t priority) {
   SOSPacket pkt;
 
@@ -276,9 +277,16 @@ SOSPacket createSOSPacket(bool earthquake, float motion, bool gas_alert, float s
   }
 
   pkt.earthquake = earthquake;
-  pkt.motion = motion;
+  pkt.motion = (isnan(motion) || motion == 0.0) ? 1.14 : motion;
+
   pkt.gas_alert = gas_alert;
-  pkt.temperature = temperature;
+
+  // Always check for valid smokePPM
+  pkt.smokePPM = (isnan(smokePPM) || smokePPM == 0.0) ? 228.0 : smokePPM;
+
+  // Always check for valid temperature
+  pkt.temperature = (isnan(temperature)) ? 27.3 : temperature;
+
   pkt.priority = priority;
 
   // Dynamic TTL based on priority (higher priority = higher TTL)
@@ -366,15 +374,17 @@ void loop() {
 
   // Read sensors
   sensors_event_t acc, gyro, temp_mpu;
-  mpu.getEvent(&acc, &gyro, &temp_mpu);
+  bool mpu_ok = mpu.getEvent(&acc, &gyro, &temp_mpu);
 
-  // Normalize accelerometer readings to G's
-  float acc_x_g = acc.acceleration.x / SENSORS_GRAVITY_STANDARD;
-  float acc_y_g = acc.acceleration.y / SENSORS_GRAVITY_STANDARD;
-  float acc_z_g = acc.acceleration.z / SENSORS_GRAVITY_STANDARD;
-  float motion = sqrt(pow(acc_x_g, 2) + pow(acc_y_g, 2) + pow(acc_z_g, 2));
-  // If motion calculation fails (NaN or zero), use default
-  if (isnan(motion) || motion == 0.0) {
+  float acc_x_g = 0, acc_y_g = 0, acc_z_g = 0, motion = 1.14;
+  if (mpu_ok) {
+    acc_x_g = acc.acceleration.x / SENSORS_GRAVITY_STANDARD;
+    acc_y_g = acc.acceleration.y / SENSORS_GRAVITY_STANDARD;
+    acc_z_g = acc.acceleration.z / SENSORS_GRAVITY_STANDARD;
+    motion = sqrt(pow(acc_x_g, 2) + pow(acc_y_g, 2) + pow(acc_z_g, 2));
+    if (isnan(motion) || motion == 0.0) motion = 1.14;
+  } else {
+    Serial.println("MPU6050 read failed! Using default motion value.");
     motion = 1.14;
   }
   bool earthquake = motion > ACC_THRESHOLD;
@@ -389,8 +399,8 @@ void loop() {
   // Read gas sensor (MQ-2)
   int gasValue = analogRead(GAS_SENSOR_PIN);
   float smokePPM = mq2AnalogToPPM(gasValue) / 10;
-  // If smokePPM is NaN or zero, use default
   if (isnan(smokePPM) || smokePPM == 0.0) {
+    Serial.println("Failed to read smoke PPM from MQ-2! Using default 228.0 PPM.");
     smokePPM = 228.0;
     gasValue = (int)((smokePPM * 10.0 / 10000.0) * 1023.0); // Approximate analog value for log
   }
@@ -411,7 +421,7 @@ void loop() {
     if (earthquake && gas_alert) priority = 3; // Highest priority
     else if (earthquake || gas_alert) priority = 2; // Medium priority
     
-    // Create the SOS packet
+    // Create the SOS packet (always fills all fields)
     SOSPacket pkt = createSOSPacket(earthquake, motion, gas_alert, smokePPM, temperature, priority);
     
     // Try to send packet
@@ -582,7 +592,7 @@ void onDataRecvStore(uint8_t *mac_addr, uint8_t *data, uint8_t len) {
   if (!alreadySeen(pkt.message_id)) {
     markSeen(pkt.message_id);
     
-    Serial.print("Processing new packet: ");
+    Serial.print("Recieved new packet: ");
     printPacket(pkt);
     
     // Store in SPIFFS
@@ -638,41 +648,15 @@ void setup() {
 }
 
 void loop() {
-  // Optional: Periodically list received packets
+  // Just a simple heartbeat/status print every minute (optional)
   static unsigned long lastReportTime = 0;
   if (millis() - lastReportTime > 60000) { // Every minute
     lastReportTime = millis();
-    
-    Serial.printf("\n--- Received %d unique messages ---\n", current_seen_ids_count);
-    
-    // Optional: Read and display stored packets from SPIFFS
-    if (SPIFFS.exists("/packets.dat")) {
-      File file = SPIFFS.open("/packets.dat", "r");
-      if (file) {
-        int packetCount = 0;
-        
-        while(file.available() >= sizeof(SOSPacket)) {
-          SOSPacket pkt;
-          file.read((uint8_t*)&pkt, sizeof(SOSPacket));
-          packetCount++;
-          
-          // Only print the most recent few to avoid flooding Serial
-          if (packetCount > file.size() / sizeof(SOSPacket) - 5) {
-            Serial.print("Stored packet: ");
-            printPacket(pkt);
-          }
-        }
-        
-        Serial.printf("Total stored packets: %d\n", packetCount);
-        file.close();
-      }
-    }
-    
-    Serial.println("-----------------------------");
+    Serial.printf("Receiver alive, seen %d unique messages\n", current_seen_ids_count);
   }
-  
   delay(1000);
 }
+
 #endif // ROLE_RECEIVER
 
 // Estimate PPM for smoke from MQ-2 analog value (very rough, for demo purposes)
