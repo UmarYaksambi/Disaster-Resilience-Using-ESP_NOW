@@ -11,8 +11,8 @@
 
 // Choose only one role by uncommenting the appropriate line
 // #define ROLE_SENDER
-// #define ROLE_REBROADCASTER
-#define ROLE_RECEIVER
+#define ROLE_REBROADCASTER
+// #define ROLE_RECEIVER
 
 // Pin definitions
 #define DHTPIN 13     // GPIO13 (D7 on NodeMCU)

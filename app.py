@@ -408,7 +408,7 @@ with tab_dashboard:
         if not st.session_state.map_data.empty and not st.session_state.map_data[['lat', 'lon']].eq(0).all().all():
             map_df_filtered = st.session_state.map_data[~((st.session_state.map_data['lat'] == 0) & (st.session_state.map_data['lon'] == 0))]
             if not map_df_filtered.empty:
-                fig = px.scatter_mapbox(
+                fig = px.scatter_map(
                     map_df_filtered,
                     lat="lat", lon="lon",
                     hover_name="message_id",
